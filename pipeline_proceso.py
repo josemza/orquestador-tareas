@@ -1,23 +1,32 @@
 # -*- coding: utf-8 -*-
 
-import subprocess
+import argparse
+import configparser
+from datetime import datetime
+import getpass
+from hashlib import sha256
+from json import loads
 import logging
 from logging.handlers import RotatingFileHandler
-import configparser
-import argparse
-import sys
-from datetime import datetime
-import pandas as pd
-import getpass
-import socket
-import win32wnet
 import os
-from db.engine import get_engine
-from sqlalchemy import DateTime, Numeric
-from send_to_cloud.http_conexion import post_to_flow
-from json import loads
-from hashlib import sha256
+import socket
+import subprocess
+import sys
 import uuid
+
+import pandas as pd
+from sqlalchemy import DateTime, Numeric
+import win32wnet
+
+from db.engine import get_engine
+from send_to_cloud.http_conexion import post_to_flow
+
+MAX_OUTPUT_CHARS = 60000
+DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+DEFAULT_ENCODING = "utf-8"
+
 
 def setup_logging(log_file, level= logging.INFO):
     """
@@ -48,8 +57,7 @@ def setup_logging(log_file, level= logging.INFO):
     console_handler.setLevel(level)
     
     # Formato de registro de log
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s',
-                                  datefmt= '%Y-%m-%d %H:%M:%S')
+    formatter = logging.Formatter(LOG_FORMAT, datefmt= LOG_DATE_FORMAT)
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
     
@@ -89,7 +97,7 @@ def fingerprint_from_norm_path(bat_path_norm: str) -> str:
 
     # No modificamos la ruta: confiamos en que ya viene normalizada.
     return sha256(bat_path_norm.encode("utf-8")).hexdigest()
-    
+
 class Pipeline:
     def __init__(self, commands,engine,process_name=None,path_log_summ=None,bat_path=None,dev_mode="False",ejecucion_id=None):
         """
@@ -104,11 +112,18 @@ class Pipeline:
                     "command": <comando_a_ejecutar>,
                     "timeout": <tiempo_maximo_opcional>,
                     "result_key": <clave para almacenar la salida> (opcional)
+                    "run_as_bat": <True/False> (opcional)
                 }
         process_name: string
             Nombre del proceso (opcional)
         path_log_summ: string
             Ruta del archivo csv donde colocar el resumen del log (exitoso o error)
+        bat_path: string
+            Ruta del archivo bat que se ejecutara
+        dev_mode: string
+            Modo de desarrollo (opcional)
+        ejecucion_id: string
+            Id de ejecucion (opcional)
 
         Returns
         -------
@@ -131,17 +146,33 @@ class Pipeline:
         logging.info(f"Nueva ejecucion {self.process_name}")
         logging.info("="*50)
     
-    def insert_rows(self, datos):
+    def insert_rows(self, datos, esquema="orquestador", tabla="log_procesos"):
+        """
+        Inserta los datos en la tabla log_procesos
+
+        Parameters
+        ----------
+        datos : pandas.DataFrame
+            DataFrame con los datos a insertar
+        esquema : string
+            Esquema donde se insertaran los datos (opcional)
+        tabla : string
+            Tabla donde se insertaran los datos (opcional)
+
+        Returns
+        -------
+        None
+        """
         datos["fecejec"] = pd.to_datetime(datos["fecejec"])
         datos["fecfin"] = pd.to_datetime(datos["fecfin"])
 
         try:
-            logging.info("Insertando resumen del log en USBDS01.log_procesos...")
-            datos.to_sql("log_procesos",
+            logging.info(f"Insertando resumen del log en {esquema}.{tabla}...")
+            datos.to_sql(tabla,
                          self.engine, 
                          if_exists="append", 
                          index=False,
-                         schema="orquestador",
+                         schema=esquema,
                          dtype={
                              "fecejec": DateTime(),
                              "fecfin": DateTime(),
@@ -149,14 +180,66 @@ class Pipeline:
                              }
                          )
         except:
-            logging.warning("No se pudo insertar el resumen del log en USBDS01.log_procesos...")
+            logging.warning(f"No se pudo insertar el resumen del log en {esquema}.{tabla}...")
     
-    def send_log_summarized(self):
+    def log_summarized_dict(self, **kwargs):
+        """
+        Genera un diccionario con el resumen del log
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Diccionario con los datos del log
+
+        Returns
+        -------
+        dict
+            Diccionario con el resumen del log
+        """
+
+        if "stage_name" and "output_error" in kwargs:
+            result_message = f'Pipeline detenido por error en la etapa {kwargs["stage_name"]}. Detalle: \n{kwargs["output_error"][:MAX_OUTPUT_CHARS]}'
+        elif "output_success" in kwargs:
+            result_message = f'Pipeline finalizado exitosamente. Detalle: \n{kwargs["output_success"][:MAX_OUTPUT_CHARS]}'
+        else:
+            result_message = ""
+
+        log_summ = {
+                            "fecejec": [datetime.strftime(self.start_time, DEFAULT_DATE_FORMAT)],
+                            "fecfin": [datetime.strftime(self.end_time, DEFAULT_DATE_FORMAT)],
+                            "duracion":[(self.end_time - self.start_time).total_seconds() / 60],
+                            "proceso": [self.process_name],
+                            "resultado":[result_message],
+                            "resumen": ["error" if "output_error" in kwargs else "exitoso"],
+                            "rutalog": [getattr(logging.getLogger(), "log_file_path",None)],
+                            "rutabat": [self.bat_path],
+                            "usuario": [getpass.getuser().upper()],
+                            "terminal":[socket.gethostname()],
+                            "bat_sha256": [self.proceso_id],
+                            "ejecucion_id": [self.ejecucion_id]
+                        }
+        return log_summ
+    
+    def send_log_summarized(self,esquema="orquestador",tabla="log_procesos"):
+        """
+        Envía el resumen del log por http post a un endpoint
+
+        Parameters
+        ----------
+        esquema : string
+            Esquema donde se consultan los datos (opcional)
+        tabla : string
+            Tabla donde se consultan los datos (opcional)
+
+        Returns
+        -------
+        None
+        """
         
         # - Consultar la vista de log para traer los datos de la tarea
         query = f"""
             SELECT FECEJEC, FECFIN, DURACION, PROCESO, RESUMEN, RESULTADO
-            FROM log_procesos
+            FROM {esquema}.{tabla}
             WHERE ejecucion_id = '{self.ejecucion_id}'
         """
 
@@ -237,7 +320,6 @@ class Pipeline:
         """
         
         captured_params = {}
-        log_summ = {}
         output_successfully = {}
         
         #Agregar la fecha de ejecucion automaticamente
@@ -300,23 +382,9 @@ class Pipeline:
                     self.end_time = datetime.now() # actualizar hora de fin
                     output_error = ''
                     if output:
-                        output_error = output[:60000]
-                    log_summ = {
-                            "fecejec": [datetime.strftime(self.start_time, "%Y-%m-%d %H:%M:%S")],
-                            "fecfin": [datetime.strftime(self.end_time, "%Y-%m-%d %H:%M:%S")],
-                            "duracion":[(self.end_time - self.start_time).total_seconds() / 60],
-                            "proceso": [self.process_name],
-                            "resultado":[f'Pipeline detenido por error en la etapa {stage_name}. Detalle: {output_error}'],
-                            "resumen": ["error"],
-                            "rutalog": [getattr(logging.getLogger(), "log_file_path",None)],
-                            "rutabat": [self.bat_path],
-                            "usuario": [getpass.getuser().upper()],
-                            "terminal":[socket.gethostname()],
-                            "bat_sha256": [self.proceso_id],
-                            "ejecucion_id": [self.ejecucion_id]
-                        }
+                        output_error = output[:MAX_OUTPUT_CHARS]
+                    log_summ = self.log_summarized_dict(stage_name=stage_name, output_error=output_error)
                     summ_pandas = pd.DataFrame(log_summ)
-                    #summ_pandas.to_csv(self.path_log_summ,sep=',',index=False)
                     
                     # Si esta en modo desarrollo no cargar el resumen a la bbdd ni desencadenar el power automate
                     if not (self.dev_mode.lower() == "true"):
@@ -349,22 +417,8 @@ class Pipeline:
             output_successfully_text += f"[Salida de la etapa: {key}]\n{line}\n{value}\n\n"
 
         self.end_time = datetime.now() # actualizar hora de fin
-        log_summ = {
-                "fecejec": self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "fecfin": self.end_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "duracion":(self.end_time - self.start_time).total_seconds() / 60,
-                "proceso": self.process_name,
-                "resultado":f"Pipeline completado exitosamente. Detalle:\n{output_successfully_text[:60000]}",
-                "resumen": "exitoso",
-                "rutalog": getattr(logging.getLogger(), "log_file_path",None),
-                "rutabat": self.bat_path,
-                "usuario": getpass.getuser().upper(),
-                "terminal": socket.gethostname(),
-                "bat_sha256": self.proceso_id,
-                "ejecucion_id": self.ejecucion_id
-            }
-        summ_pandas = pd.DataFrame(log_summ,index=[0])
-        #summ_pandas.to_csv(self.path_log_summ,sep=',',index=False)
+        log_summ = self.log_summarized_dict(output_success=output_successfully_text)
+        summ_pandas = pd.DataFrame(log_summ)
 
         # Si esta en modo desarrollo no cargar el resumen a la bd ni desencadenar el power automate
         if not (self.dev_mode.lower() == "true"):
