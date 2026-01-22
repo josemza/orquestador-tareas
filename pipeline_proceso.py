@@ -2,6 +2,7 @@
 
 import argparse
 import configparser
+from dataclasses import dataclass
 from datetime import datetime
 import getpass
 from hashlib import sha256
@@ -12,6 +13,7 @@ import os
 import socket
 import subprocess
 import sys
+from typing import Any, Optional
 import uuid
 
 import pandas as pd
@@ -27,7 +29,7 @@ LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
 DEFAULT_ENCODING = "utf-8"
 
 
-def setup_logging(log_file, level=logging.INFO):
+def setup_logging(log_file: str, level: int = logging.INFO) -> logging.Logger:
     """
     Configura el logging para que se registre log por consola y archivo
 
@@ -68,7 +70,7 @@ def setup_logging(log_file, level=logging.INFO):
     
     return logger
 
-def get_unc_path(path):
+def get_unc_path(path: str) -> str:
     # Asegura que la ruta este con doble backslash o raw string
     path = os.path.abspath(path)
     
@@ -97,6 +99,15 @@ def fingerprint_from_norm_path(bat_path_norm: str) -> str:
     # No modificamos la ruta: confiamos en que ya viene normalizada.
     return sha256(bat_path_norm.encode(DEFAULT_ENCODING)).hexdigest()
 
+@dataclass(frozen=True)
+class StageResult:
+    ok: bool
+    returncode: int
+    stdout: str
+    stderr: str
+    duration_s: float
+    fatal: bool
+    error: Optional[str] = None
 
 class Pipeline:
     def __init__(self, commands,engine,process_name=None,log_file=None,path_log_summ=None,bat_path=None,dev_mode="False",ejecucion_id=None):
@@ -149,7 +160,7 @@ class Pipeline:
         logging.info(f"Nueva ejecucion {self.process_name}")
         logging.info("="*50)
     
-    def insert_rows(self, datos, esquema="orquestador", tabla="log_procesos"):
+    def insert_rows(self, datos: pd.DataFrame, esquema: str = "orquestador", tabla: str = "log_procesos") -> None:
         """
         Inserta los datos en la tabla log_procesos
 
@@ -185,7 +196,7 @@ class Pipeline:
         except:
             logging.warning(f"No se pudo insertar el resumen del log en {esquema}.{tabla}...")
     
-    def log_summarized_dict(self, **kwargs):
+    def log_summarized_dict(self, **kwargs) -> dict[str, list[Any]]:
         """
         Genera un diccionario con el resumen del log
 
@@ -223,7 +234,7 @@ class Pipeline:
                         }
         return log_summ
     
-    def send_log_summarized(self,esquema="orquestador",tabla="log_procesos"):
+    def send_log_summarized(self,esquema: str ="orquestador",tabla: str ="log_procesos") -> None:
         """
         Envía el resumen del log por http post a un endpoint
 
@@ -264,7 +275,7 @@ class Pipeline:
             except Exception as e:
                 logging.warning(f"Error al enviar correo: {e}")
 
-    def run_stage(self, stage_name, command, timeout=None):
+    def run_stage(self, stage_name: str, command: str, timeout: Optional[int] = None) -> StageResult:
         """
         Ejecuta una etapa del pipeline y registra la salida y errores. 
         Si ocurre un error o se excede el tiempo de espera, retorna False
@@ -280,9 +291,13 @@ class Pipeline:
 
         Returns
         -------
-        Tupla (exito, salida)
-            exito: True si el comando termino correctamente (codigo 0)
-            salida: el contenido de stdout (strip() aplicado) o None en caso de error
+        StageResult
+            ok: True si el comando termino correctamente (codigo 0)
+            returncode: el codigo de retorno del comando
+            stdout: el contenido de stdout (strip() aplicado) o None en caso de error
+            stderr: el contenido de stderr (strip() aplicado) o None en caso de error
+            error: el contenido de la excepcion o None en caso de error
+            duration_s: el tiempo de ejecucion en segundos
 
         """
         
@@ -298,18 +313,49 @@ class Pipeline:
             
             if result.returncode != 0:
                 logging.error(f"Error en {stage_name} (codigo: {result.returncode}). Deteniendo el pipeline")
-                return False, result.stderr or result.stdout
+                return StageResult(
+                    ok=False,
+                    returncode=result.returncode,
+                    stdout=(result.stdout or "").strip(),
+                    stderr=(result.stderr or "").strip(),
+                    duration_s=(datetime.now() - self.start_time).total_seconds(),
+                    fatal=True
+                )
             
             logging.info(f"{stage_name} completada exitosamente")
-            return True, result.stdout.strip()
+            return StageResult(
+                ok=True,
+                returncode=0,
+                stdout=(result.stdout or "").strip(),
+                stderr=(result.stderr or "").strip(),
+                duration_s=(datetime.now() - self.start_time).total_seconds(),
+                fatal=False
+            )
+
         except subprocess.TimeoutExpired as e:
             logging.error(f"Tiempo de espera excedido en {stage_name}: {e}")
-            return False, None
+            return StageResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr="",
+                error=str(e).strip(),
+                duration_s=(datetime.now() - self.start_time).total_seconds(),
+                fatal=True
+            )
         except Exception as e:
             logging.error(f"Excepcion en {stage_name}: {e}")
-            return False, e
+            return StageResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr="",
+                error=str(e).strip(),
+                duration_s=(datetime.now() - self.start_time).total_seconds(),
+                fatal=True
+            )
     
-    def run(self):
+    def run(self) -> bool:
         """
         Ejecuta todas la etapas en secuencia. Si alguna falla, detiene el pipeline.
         Permite capturar parametros producidos en una etapa y usarlos en comandos posteriores,
@@ -322,8 +368,8 @@ class Pipeline:
 
         """
         
-        captured_params = {}
-        output_successfully = {}
+        captured_params: dict[str, Any] = {}
+        output_successfully: dict[str, str] = {}
         
         #Agregar la fecha de ejecucion automaticamente
         now = datetime.now()
@@ -354,6 +400,10 @@ class Pipeline:
             command = stage["command"]
             timeout = stage.get("timeout", None)
             run_as_bat = stage.get("run_as_bat","False").lower() == "true"
+            # si en la configuracion se definio show_output = 'true', se guarda la salida
+            show_output = stage.get("show_output","False").lower() == "true"
+            # si en la configuracion se definio 'result_key', se guarda la salida
+            result_key = stage.get("result_key", None)
             
             if run_as_bat: # Verifica si en la estapa se ha configurado la ejecucion de un BAT
                 logging.info("-"*50)
@@ -361,13 +411,40 @@ class Pipeline:
                 try:
                     # Ejecuta el archivo BAT. Se lanza sin esperar que termine
                     subprocess.Popen(f'start "" /min "{command}"',shell=True)
-                    #subprocess.Popen(command, shell=True)
-                    success = True
-                    output = "Bat iniciado"
+                    result = StageResult(
+                        ok=True,
+                        returncode=0,
+                        stdout="iniciado",
+                        stderr="",
+                        duration_s=(datetime.now() - self.start_time).total_seconds(),
+                        fatal=False
+                    )
+
+                    if result_key:
+                        captured_params[result_key] = "iniciado" # output
+                        logging.info(f"parametro capturado: {result_key} = {result.stdout}")
+
+                    if show_output:
+                        output_successfully[stage_name] = result.stdout
+
                 except Exception as e:
                     logging.error(f"Error ejecutando BAT en {stage_name}: {e}")
-                    success = False
-                    output = str(e)
+                    result = StageResult(
+                        ok=False,
+                        returncode=1,
+                        stdout="",
+                        stderr="",
+                        error=f"Error al iniciar BAT paralelo en {stage_name}: {e}",
+                        duration_s=(datetime.now() - self.start_time).total_seconds(),
+                        fatal=False
+                    )
+
+                    if result_key:
+                        captured_params[result_key] = "no_iniciado" # output
+                        logging.info(f"parametro capturado: {result_key} = {result.error}")
+
+                    if show_output:
+                        output_successfully[stage_name] = result.error
             else:
                 # Si existen parametros capturados, se sustituyen en el comando (usando formato)
                 if captured_params:
@@ -377,16 +454,16 @@ class Pipeline:
                         logging.error(f"Falta el parametro {e} para el comando en la etapa '{stage_name}'.")
                         return False
                 
-                success, output = self.run_stage(stage_name, command, timeout)
-                if not success:
+                result = self.run_stage(stage_name, command, timeout)
+                if not result.ok and result.fatal:
                     logging.info("-"*50)
                     logging.error(f"##> RESULTADO: Pipeline detenido por error en la etapa {stage_name}.")
                     
                     self.end_time = datetime.now() # actualizar hora de fin
-                    output_error = ''
-                    if output:
-                        output_error = output[:MAX_OUTPUT_CHARS]
-                    log_summ = self.log_summarized_dict(stage_name=stage_name, output_error=output_error)
+                    # output_error = ''
+                    # if result.stderr or result.stdout or result.error:
+                    output_error = result.stderr or result.stdout or result.error or ""
+                    log_summ = self.log_summarized_dict(stage_name=stage_name, output_error=output_error[:MAX_OUTPUT_CHARS])
                     summ_pandas = pd.DataFrame(log_summ)
                     
                     # Si esta en modo desarrollo no cargar el resumen a la bbdd ni desencadenar el power automate
@@ -399,16 +476,12 @@ class Pipeline:
                         
                     return False
                 
-                # si en la configuracion se definio 'result_key', se guarda la salida
-                result_key = stage.get("result_key", None)
                 if result_key:
-                    captured_params[result_key] = output
-                    logging.info(f"parametro capturado: {result_key} = {output}")
+                    captured_params[result_key] = result.stdout # output
+                    logging.info(f"parametro capturado: {result_key} = {result.stdout}")
                 
-                # si en la configuracion se definio show_output = 'true', se guarda la salida
-                show_output = stage.get("show_output","False").lower() == "true"
                 if show_output:
-                    output_successfully[stage_name] = output
+                    output_successfully[stage_name] = result.stdout # output
         
         logging.info("-"*50)
         logging.info("##> RESULTADO: Pipeline completado exitosamente")
