@@ -23,18 +23,17 @@ from send_to_cloud.http_conexion import post_to_flow
 
 MAX_OUTPUT_CHARS = 60000
 DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
 DEFAULT_ENCODING = "utf-8"
 
 
-def setup_logging(log_file, level= logging.INFO):
+def setup_logging(log_file, level=logging.INFO):
     """
     Configura el logging para que se registre log por consola y archivo
 
     Parameters
     ----------
-    logFile : string
+    log_file : string
         nombre del archivo log.
     level : objeto, optional
         nivel de registro en el log. por defecto es logging.INFO.
@@ -57,7 +56,7 @@ def setup_logging(log_file, level= logging.INFO):
     console_handler.setLevel(level)
     
     # Formato de registro de log
-    formatter = logging.Formatter(LOG_FORMAT, datefmt= LOG_DATE_FORMAT)
+    formatter = logging.Formatter(LOG_FORMAT, datefmt= DEFAULT_DATE_FORMAT)
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
     
@@ -96,10 +95,11 @@ def fingerprint_from_norm_path(bat_path_norm: str) -> str:
         raise ValueError("bat_path_norm debe ser un string no vacío ya normalizado.")
 
     # No modificamos la ruta: confiamos en que ya viene normalizada.
-    return sha256(bat_path_norm.encode("utf-8")).hexdigest()
+    return sha256(bat_path_norm.encode(DEFAULT_ENCODING)).hexdigest()
+
 
 class Pipeline:
-    def __init__(self, commands,engine,process_name=None,path_log_summ=None,bat_path=None,dev_mode="False",ejecucion_id=None):
+    def __init__(self, commands,engine,process_name=None,log_file=None,path_log_summ=None,bat_path=None,dev_mode="False",ejecucion_id=None):
         """
         Clase para manejar las etapas del proceso
 
@@ -114,6 +114,8 @@ class Pipeline:
                     "result_key": <clave para almacenar la salida> (opcional)
                     "run_as_bat": <True/False> (opcional)
                 }
+        engine: sqlalchemy.engine.base.Engine
+            engine de sqlalchemy con la conexión a la base de datos
         process_name: string
             Nombre del proceso (opcional)
         path_log_summ: string
@@ -134,12 +136,13 @@ class Pipeline:
         self.commands = commands
         self.process_name = process_name
         self.path_log_summ = path_log_summ
+        self.log_file = log_file
         self.bat_path = bat_path
         self.start_time = datetime.now()
         self.end_time = datetime.now()
         self.engine = engine
         self.dev_mode = dev_mode
-        self.proceso_id = fingerprint_from_norm_path(self.bat_path)
+        self.proceso_id = fingerprint_from_norm_path(self.bat_path) if self.bat_path else None
         self.ejecucion_id = ejecucion_id
         
         logging.info("="*50)
@@ -197,7 +200,7 @@ class Pipeline:
             Diccionario con el resumen del log
         """
 
-        if "stage_name" and "output_error" in kwargs:
+        if "stage_name" in kwargs and "output_error" in kwargs:
             result_message = f'Pipeline detenido por error en la etapa {kwargs["stage_name"]}. Detalle: \n{kwargs["output_error"][:MAX_OUTPUT_CHARS]}'
         elif "output_success" in kwargs:
             result_message = f'Pipeline finalizado exitosamente. Detalle: \n{kwargs["output_success"][:MAX_OUTPUT_CHARS]}'
@@ -211,7 +214,7 @@ class Pipeline:
                             "proceso": [self.process_name],
                             "resultado":[result_message],
                             "resumen": ["error" if "output_error" in kwargs else "exitoso"],
-                            "rutalog": [getattr(logging.getLogger(), "log_file_path",None)],
+                            "rutalog": [self.log_file],
                             "rutabat": [self.bat_path],
                             "usuario": [getpass.getuser().upper()],
                             "terminal":[socket.gethostname()],
@@ -291,7 +294,7 @@ class Pipeline:
                 if result.stdout:
                     logging.info(f"{stage_name} OUTPUT:\n{result.stdout}")
                 if result.stderr:
-                    logging.warning(f"{stage_name} OUTPUT:\n{result.stderr}")
+                    logging.warning(f"{stage_name} STDERR:\n{result.stderr}")
             
             if result.returncode != 0:
                 logging.error(f"Error en {stage_name} (codigo: {result.returncode}). Deteniendo el pipeline")
@@ -475,10 +478,10 @@ def main():
                 })
     
     # Obtener la ruta UNC del bat en caso llegue como ruta mapeada X:, Z:, etc
-    bat_path = get_unc_path(args.batpath)
+    bat_path = get_unc_path(args.batpath) if args.batpath else None
     ejecucion_id = str(uuid.uuid4())
     
-    pipeline = Pipeline(commands,engine,process_name,path_log_summ,bat_path,dev_mode, ejecucion_id)
+    pipeline = Pipeline(commands,engine,process_name,log_file,path_log_summ,bat_path,dev_mode, ejecucion_id)
     success = pipeline.run()
     
     if not success:
