@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
+from configparser import ConfigParser
 import argparse
-import configparser
 from dataclasses import dataclass
 from datetime import datetime
 import getpass
@@ -13,11 +13,12 @@ import os
 import socket
 import subprocess
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, List
 import uuid
 
 import pandas as pd
 from sqlalchemy import DateTime, Numeric
+from sqlalchemy.engine import Engine
 import win32wnet
 
 from db.engine import get_engine
@@ -28,6 +29,25 @@ DEFAULT_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
 DEFAULT_ENCODING = "utf-8"
 
+@dataclass(frozen=True)
+class StageResult:
+    ok: bool
+    returncode: int
+    stdout: str
+    stderr: str
+    duration_s: float
+    fatal: bool
+    error: Optional[str] = None
+
+@dataclass(frozen=True)
+class StageConfig:
+    name: str
+    command: str
+    run_as_bat: bool = False
+    show_output: bool = False
+    timeout: Optional[int] = None
+    result_key: Optional[str] = None
+    condicion: Optional[str] = None
 
 def setup_logging(log_file: str, level: int = logging.INFO) -> logging.Logger:
     """
@@ -99,18 +119,38 @@ def fingerprint_from_norm_path(bat_path_norm: str) -> str:
     # No modificamos la ruta: confiamos en que ya viene normalizada.
     return sha256(bat_path_norm.encode(DEFAULT_ENCODING)).hexdigest()
 
-@dataclass(frozen=True)
-class StageResult:
-    ok: bool
-    returncode: int
-    stdout: str
-    stderr: str
-    duration_s: float
-    fatal: bool
-    error: Optional[str] = None
+def parse_bool(value: str, default: bool = False) -> bool:
+    if value is None:
+        return default
+    key = value.strip().lower()
+    values_map = {
+        "true": True, "1": True, "yes": True, "y": True,
+        "false": False, "0": False, "no": False, "n": False,
+    }
+    return values_map.get(key, default)
+
+def build_stage(config: ConfigParser, section: str) -> StageConfig:
+    stage_name = section
+    command = config.get(section, "command")
+    timeout = config.getint(section, "timeout", fallback=None)
+    result_key = config.get(section, "result_key", fallback=None)
+    condicion = config.get(section, "condicion", fallback=None)
+    run_as_bat = parse_bool(config.get(section, "run_as_bat", fallback="false"))
+    show_output = parse_bool(config.get(section, "show_output", fallback="false"))
+
+    return StageConfig(
+        name=stage_name,
+        command=command,
+        run_as_bat=run_as_bat,
+        show_output=show_output,
+        timeout=timeout,
+        result_key=result_key,
+        condicion=condicion,
+    )
+
 
 class Pipeline:
-    def __init__(self, commands,engine,process_name=None,log_file=None,path_log_summ=None,bat_path=None,dev_mode="False",ejecucion_id=None):
+    def __init__(self, commands: list[StageConfig],engine: Engine,process_name: str = None,log_file: str = None,path_log_summ: str = None,bat_path: str = None,dev_mode: str = "False",ejecucion_id: str = None) -> None:
         """
         Clase para manejar las etapas del proceso
 
@@ -144,7 +184,7 @@ class Pipeline:
 
         """
         
-        self.commands = commands
+        self.commands: list[StageConfig] = commands
         self.process_name = process_name
         self.path_log_summ = path_log_summ
         self.log_file = log_file
@@ -160,6 +200,25 @@ class Pipeline:
         logging.info(f"Nueva ejecucion {self.process_name}")
         logging.info("="*50)
     
+    def _should_skip_stage(self, stage: StageConfig, captured_params: dict[str,Any]) -> bool:
+        # Se sustituyen las variables capturadas en la condición
+        condicion_formateada = stage.condicion.format(**captured_params)
+        # Se evalúa la condición. Debe retornar un valor booleano.
+        if not eval(condicion_formateada, {"__builtins__": {}}, captured_params):
+            return True
+
+        return False
+    
+    def _record_stage_output(self, stage: StageConfig, result: StageResult, output_successfully: dict[str,str], captured_params: dict[str,Any]) -> None:
+        if stage.result_key:
+            captured_params[stage.result_key] = result.stdout # output
+            logging.info(f"parametro capturado: {stage.result_key} = {result.stdout}")
+            if stage.run_as_bat and (result.error or "").strip():
+                logging.warning(result.error)
+        
+        if stage.show_output:
+            output_successfully[stage.name] = result.stdout # output
+
     def insert_rows(self, datos: pd.DataFrame, esquema: str = "orquestador", tabla: str = "log_procesos") -> None:
         """
         Inserta los datos en la tabla log_procesos
@@ -193,7 +252,7 @@ class Pipeline:
                              "duracion": Numeric(8,3)
                              }
                          )
-        except:
+        except Exception:
             logging.warning(f"No se pudo insertar el resumen del log en {esquema}.{tabla}...")
     
     def log_summarized_dict(self, **kwargs) -> dict[str, list[Any]]:
@@ -377,40 +436,27 @@ class Pipeline:
         captured_params["mes"] = now.strftime("%m")
         captured_params["dia"] = now.strftime("%d")        
         
-        for stage in self.commands:
-            stage_name = stage["name"]
-            condicion = stage["condicion"]
-            
+        for stage in self.commands:           
             # Si se define la condición, se evalúa antes de ejecutar la etapa
-            if condicion:
+            if stage.condicion:
                 try:
-                    # Se sustituyen las variables capturadas en la condición
-                    condicion_formateada = condicion.format(**captured_params)
-                    # Se evalúa la condición. Debe retornar un valor booleano.
-                    if not eval(condicion_formateada):
-                        logging.info(f"Se omite la etapa '{stage_name}' por la condición: {condicion_formateada}")
+                    skip_stage = self._should_skip_stage(stage,captured_params)
+                    if skip_stage:
+                        logging.info(f"Se omite la etapa '{stage.name}' por la condición: {stage.condicion.format(**captured_params)}")
                         continue  # Se salta esta etapa
                 except KeyError as e:
-                    logging.error(f"Falta el parámetro {e} para evaluar la condición en la etapa '{stage_name}'.")
+                    logging.error(f"Falta el parámetro {e} para evaluar la condición en la etapa '{stage.name}'.")
                     return False
                 except Exception as e:
-                    logging.error(f"Error al evaluar la condición en la etapa '{stage_name}': {e}")
+                    logging.error(f"Error al evaluar la condición en la etapa '{stage.name}': {e}")
                     return False
             
-            command = stage["command"]
-            timeout = stage.get("timeout", None)
-            run_as_bat = stage.get("run_as_bat","False").lower() == "true"
-            # si en la configuracion se definio show_output = 'true', se guarda la salida
-            show_output = stage.get("show_output","False").lower() == "true"
-            # si en la configuracion se definio 'result_key', se guarda la salida
-            result_key = stage.get("result_key", None)
-            
-            if run_as_bat: # Verifica si en la estapa se ha configurado la ejecucion de un BAT
+            if stage.run_as_bat: # Verifica si en la estapa se ha configurado la ejecucion de un BAT
                 logging.info("-"*50)
-                logging.info(f"Iniciando etapa (BAT): {stage_name} ejecutando: {command}")
+                logging.info(f"Iniciando etapa (BAT): {stage.name} ejecutando: {stage.command}")
                 try:
                     # Ejecuta el archivo BAT. Se lanza sin esperar que termine
-                    subprocess.Popen(f'start "" /min "{command}"',shell=True)
+                    subprocess.Popen(f'start "" /min "{stage.command}"',shell=True)
                     result = StageResult(
                         ok=True,
                         returncode=0,
@@ -420,50 +466,53 @@ class Pipeline:
                         fatal=False
                     )
 
-                    if result_key:
-                        captured_params[result_key] = "iniciado" # output
-                        logging.info(f"parametro capturado: {result_key} = {result.stdout}")
+                    self._record_stage_output(stage,result,output_successfully,captured_params)
+                    # if stage.result_key:
+                    #     captured_params[stage.result_key] = "iniciado" # output
+                    #     logging.info(f"parametro capturado: {stage.result_key} = {result.stdout}")
 
-                    if show_output:
-                        output_successfully[stage_name] = result.stdout
+                    # if stage.show_output:
+                    #     output_successfully[stage.name] = result.stdout
 
                 except Exception as e:
-                    logging.error(f"Error ejecutando BAT en {stage_name}: {e}")
+                    logging.error(f"Error ejecutando BAT en {stage.name}: {e}")
                     result = StageResult(
                         ok=False,
                         returncode=1,
-                        stdout="",
+                        stdout="no_iniciado",
                         stderr="",
-                        error=f"Error al iniciar BAT paralelo en {stage_name}: {e}",
+                        error=f"Error al iniciar BAT paralelo en {stage.name}: {e}",
                         duration_s=(datetime.now() - self.start_time).total_seconds(),
                         fatal=False
                     )
 
-                    if result_key:
-                        captured_params[result_key] = "no_iniciado" # output
-                        logging.info(f"parametro capturado: {result_key} = {result.error}")
+                    self._record_stage_output(stage,result,output_successfully,captured_params)
+                    # if stage.result_key:
+                    #     captured_params[stage.result_key] = "no_iniciado" # output
+                    #     logging.info(f"parametro capturado: {stage.result_key} = {result.error}")
 
-                    if show_output:
-                        output_successfully[stage_name] = result.error
+                    # if stage.show_output:
+                    #     output_successfully[stage.name] = result.error
             else:
                 # Si existen parametros capturados, se sustituyen en el comando (usando formato)
+                command_params = stage.command
                 if captured_params:
                     try:
-                        command = command.format(**captured_params)
+                        command_params = stage.command.format(**captured_params)
                     except KeyError as e:
-                        logging.error(f"Falta el parametro {e} para el comando en la etapa '{stage_name}'.")
+                        logging.error(f"Falta el parametro {e} para el comando en la etapa '{stage.name}'.")
                         return False
                 
-                result = self.run_stage(stage_name, command, timeout)
+                result = self.run_stage(stage.name, command_params or stage.command, stage.timeout)
                 if not result.ok and result.fatal:
                     logging.info("-"*50)
-                    logging.error(f"##> RESULTADO: Pipeline detenido por error en la etapa {stage_name}.")
+                    logging.error(f"##> RESULTADO: Pipeline detenido por error en la etapa {stage.name}.")
                     
                     self.end_time = datetime.now() # actualizar hora de fin
                     # output_error = ''
                     # if result.stderr or result.stdout or result.error:
                     output_error = result.stderr or result.stdout or result.error or ""
-                    log_summ = self.log_summarized_dict(stage_name=stage_name, output_error=output_error[:MAX_OUTPUT_CHARS])
+                    log_summ = self.log_summarized_dict(stage_name=stage.name, output_error=output_error[:MAX_OUTPUT_CHARS])
                     summ_pandas = pd.DataFrame(log_summ)
                     
                     # Si esta en modo desarrollo no cargar el resumen a la bbdd ni desencadenar el power automate
@@ -476,12 +525,13 @@ class Pipeline:
                         
                     return False
                 
-                if result_key:
-                    captured_params[result_key] = result.stdout # output
-                    logging.info(f"parametro capturado: {result_key} = {result.stdout}")
+                self._record_stage_output(stage,result,output_successfully,captured_params)
+                # if stage.result_key:
+                #     captured_params[stage.result_key] = result.stdout # output
+                #     logging.info(f"parametro capturado: {stage.result_key} = {result.stdout}")
                 
-                if show_output:
-                    output_successfully[stage_name] = result.stdout # output
+                # if stage.show_output:
+                #     output_successfully[stage.name] = result.stdout # output
         
         logging.info("-"*50)
         logging.info("##> RESULTADO: Pipeline completado exitosamente")
@@ -514,7 +564,7 @@ def main():
     args = parser.parse_args()
     
     # Cargar configuracion externa
-    config = configparser.ConfigParser()
+    config = ConfigParser()
     config.read(args.config)
     
     # Configuracion general del log
@@ -530,25 +580,10 @@ def main():
     
     # Definir las etapas del pipeline basadas en el archivo de configuracion
     # Se puede tener en el archivo una seccion GENERAL y luego una seccion por cada etapa
-    commands = []
+    commands: list[StageConfig] = []
     for section in config.sections():
         if section != "GENERAL":
-            stage_name = section
-            command = config.get(section, "command")
-            timeout = config.getint(section, "timeout", fallback=None)
-            result_key = config.get(section, "result_key", fallback=None)
-            condicion = config.get(section, "condicion", fallback=None)
-            run_as_bat = config.get(section, "run_as_bat", fallback="false")
-            show_output = config.get(section, "show_output", fallback="false")
-            commands.append({
-                "name": stage_name, 
-                "command": command, 
-                "timeout": timeout,
-                "result_key": result_key,
-                "condicion": condicion,
-                "run_as_bat": run_as_bat,
-                "show_output": show_output
-                })
+            commands.append(build_stage(config,section))
     
     # Obtener la ruta UNC del bat en caso llegue como ruta mapeada X:, Z:, etc
     bat_path = get_unc_path(args.batpath) if args.batpath else None
