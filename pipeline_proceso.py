@@ -13,7 +13,8 @@ import os
 import socket
 import subprocess
 import sys
-from typing import Any, Optional, List
+import time
+from typing import Any, Optional
 import uuid
 
 import pandas as pd
@@ -363,7 +364,9 @@ class Pipeline:
         logging.info("-"*50)
         logging.info(f"Iniciando etapa: {stage_name}")
         try:
+            t0 = time.perf_counter()
             result =  subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+            elapsed = time.perf_counter() - t0
             if result.returncode == 0:
                 if result.stdout:
                     logging.info(f"{stage_name} OUTPUT:\n{result.stdout}")
@@ -377,7 +380,7 @@ class Pipeline:
                     returncode=result.returncode,
                     stdout=(result.stdout or "").strip(),
                     stderr=(result.stderr or "").strip(),
-                    duration_s=(datetime.now() - self.start_time).total_seconds(),
+                    duration_s=elapsed/60,
                     fatal=True
                 )
             
@@ -387,11 +390,12 @@ class Pipeline:
                 returncode=0,
                 stdout=(result.stdout or "").strip(),
                 stderr=(result.stderr or "").strip(),
-                duration_s=(datetime.now() - self.start_time).total_seconds(),
+                duration_s=elapsed/60,
                 fatal=False
             )
 
         except subprocess.TimeoutExpired as e:
+            elapsed = time.perf_counter() - t0
             logging.error(f"Tiempo de espera excedido en {stage_name}: {e}")
             return StageResult(
                 ok=False,
@@ -399,10 +403,11 @@ class Pipeline:
                 stdout="",
                 stderr="",
                 error=str(e).strip(),
-                duration_s=(datetime.now() - self.start_time).total_seconds(),
+                duration_s=elapsed/60,
                 fatal=True
             )
         except Exception as e:
+            elapsed = time.perf_counter() - t0
             logging.error(f"Excepcion en {stage_name}: {e}")
             return StageResult(
                 ok=False,
@@ -410,7 +415,7 @@ class Pipeline:
                 stdout="",
                 stderr="",
                 error=str(e).strip(),
-                duration_s=(datetime.now() - self.start_time).total_seconds(),
+                duration_s=elapsed/60,
                 fatal=True
             )
     
@@ -462,17 +467,11 @@ class Pipeline:
                         returncode=0,
                         stdout="iniciado",
                         stderr="",
-                        duration_s=(datetime.now() - self.start_time).total_seconds(),
+                        duration_s=0,
                         fatal=False
                     )
 
                     self._record_stage_output(stage,result,output_successfully,captured_params)
-                    # if stage.result_key:
-                    #     captured_params[stage.result_key] = "iniciado" # output
-                    #     logging.info(f"parametro capturado: {stage.result_key} = {result.stdout}")
-
-                    # if stage.show_output:
-                    #     output_successfully[stage.name] = result.stdout
 
                 except Exception as e:
                     logging.error(f"Error ejecutando BAT en {stage.name}: {e}")
@@ -482,17 +481,11 @@ class Pipeline:
                         stdout="no_iniciado",
                         stderr="",
                         error=f"Error al iniciar BAT paralelo en {stage.name}: {e}",
-                        duration_s=(datetime.now() - self.start_time).total_seconds(),
+                        duration_s=0,
                         fatal=False
                     )
 
                     self._record_stage_output(stage,result,output_successfully,captured_params)
-                    # if stage.result_key:
-                    #     captured_params[stage.result_key] = "no_iniciado" # output
-                    #     logging.info(f"parametro capturado: {stage.result_key} = {result.error}")
-
-                    # if stage.show_output:
-                    #     output_successfully[stage.name] = result.error
             else:
                 # Si existen parametros capturados, se sustituyen en el comando (usando formato)
                 command_params = stage.command
@@ -509,8 +502,6 @@ class Pipeline:
                     logging.error(f"##> RESULTADO: Pipeline detenido por error en la etapa {stage.name}.")
                     
                     self.end_time = datetime.now() # actualizar hora de fin
-                    # output_error = ''
-                    # if result.stderr or result.stdout or result.error:
                     output_error = result.stderr or result.stdout or result.error or ""
                     log_summ = self.log_summarized_dict(stage_name=stage.name, output_error=output_error[:MAX_OUTPUT_CHARS])
                     summ_pandas = pd.DataFrame(log_summ)
@@ -526,12 +517,6 @@ class Pipeline:
                     return False
                 
                 self._record_stage_output(stage,result,output_successfully,captured_params)
-                # if stage.result_key:
-                #     captured_params[stage.result_key] = result.stdout # output
-                #     logging.info(f"parametro capturado: {stage.result_key} = {result.stdout}")
-                
-                # if stage.show_output:
-                #     output_successfully[stage.name] = result.stdout # output
         
         logging.info("-"*50)
         logging.info("##> RESULTADO: Pipeline completado exitosamente")
