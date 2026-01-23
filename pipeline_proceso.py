@@ -50,43 +50,42 @@ class StageConfig:
     result_key: Optional[str] = None
     condicion: Optional[str] = None
 
-def setup_logging(log_file: str, level: int = logging.INFO) -> logging.Logger:
+def setup_logging(log_file: str, level: int = logging.INFO, *, max_bytes: int = 5*1024 * 1024, backup_count: int = 5) -> logging.Logger:
     """
-    Configura el logging para que se registre log por consola y archivo
-
-    Parameters
-    ----------
-    log_file : string
-        nombre del archivo log.
-    level : objeto, optional
-        nivel de registro en el log. por defecto es logging.INFO.
-
-    Returns
-    -------
-    logger
-
+    Configurar logging en ROOT logger (logging.info/ warning / error) de forma idempotente.
+    - Consola + RotatingFileHandler
+    - Evita duplicar handlers si se llama más de una vez
+    - Expone la ruta del log como logger.log_file_path
     """
     
-    logger = logging.getLogger()
+    logger = logging.getLogger()  # ROOT
+
+    # Si ya hay handlers, no vuelvas a agregar (evita logs duplicados)
+    if logger.handlers:
+        logger.setLevel(level)
+        setattr(logger, "log_file_path", log_file)
+        return logger
+
     logger.setLevel(level)
-    
-    # Handler para archivo
-    file_handler = RotatingFileHandler(log_file)
+
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=DEFAULT_DATE_FORMAT)
+
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding=DEFAULT_ENCODING,
+    )
     file_handler.setLevel(level)
-    
-    # Handler para consola
+    file_handler.setFormatter(formatter)
+
     console_handler = logging.StreamHandler()
     console_handler.setLevel(level)
-    
-    # Formato de registro de log
-    formatter = logging.Formatter(LOG_FORMAT, datefmt= DEFAULT_DATE_FORMAT)
-    file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
-    
+
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-    
-    # Agregar atributo con la ruta del log al logger
+
     setattr(logger, "log_file_path", file_handler.baseFilename)
     
     return logger
@@ -554,7 +553,7 @@ def main():
     
     # Configuracion general del log
     log_file = config.get("GENERAL", "log_file", fallback="proceso.log")
-    setup_logging(log_file)
+    logger = setup_logging(log_file)
     
     path_log_summ = config.get("GENERAL", "path_log_summ", fallback=None)
     process_name = config.get("GENERAL", "process_name", fallback=None)
@@ -584,25 +583,5 @@ if __name__ == "__main__":
     main()
     
         
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
     
     
