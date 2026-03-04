@@ -1,13 +1,17 @@
 from datetime import datetime
 import getpass
+import hashlib
 from json import loads
+from html import escape
 import logging
+import re
 import socket
 import subprocess
 import time
 from typing import Optional, Any
 
 import pandas as pd
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.types import DateTime, Numeric
 
@@ -18,7 +22,17 @@ from orquestador.constants import MAX_OUTPUT_CHARS, DEFAULT_DATE_FORMAT
 
 
 class Pipeline:
-    def __init__(self, commands: list[StageConfig],engine: Engine,process_name: str = None,log_file: str = None,path_log_summ: str = None,bat_path: str = None,dev_mode: str = "False",ejecucion_id: str = None) -> None:
+    def __init__(
+        self,
+        commands: list[StageConfig],
+        engine: Engine,
+        process_name: str = None,
+        log_file: str = None,
+        path_log_summ: str = None,
+        bat_path: str = None,
+        dev_mode: str = "False",
+        ejecucion_id: str = None,
+    ) -> None:
         """
         Clase para manejar las etapas del proceso
 
@@ -28,7 +42,10 @@ class Pipeline:
             lista de diccionarios con la estructura:
                 {
                     "name": <nombre_etapa>,
-                    "command": <comando_a_ejecutar>,
+                    "type": <command|query> (opcional, por defecto command),
+                    "command": <comando_a_ejecutar> (requerido para command),
+                    "query_sql": <consulta_select> (requerido para query),
+                    "query_title": <titulo_html_consulta> (opcional),
                     "timeout": <tiempo_maximo_opcional>,
                     "result_key": <clave para almacenar la salida> (opcional)
                     "run_as_bat": <True/False> (opcional)
@@ -63,10 +80,149 @@ class Pipeline:
         self.dev_mode = dev_mode
         self.proceso_id = fingerprint_from_norm_path(self.bat_path) if self.bat_path else None
         self.ejecucion_id = ejecucion_id
+        self.query_sections: list[dict[str, Any]] = []
         
         logging.info("="*50)
         logging.info(f"Nueva ejecucion {self.process_name}")
         logging.info("="*50)
+
+    @staticmethod
+    def _clean_sql(query: str) -> str:
+        return (query or "").strip().rstrip(";").strip()
+
+    def _is_safe_select_query(self, query: str) -> bool:
+        clean = self._clean_sql(query)
+        if not clean:
+            return False
+
+        # Evita multiples sentencias y operaciones DML/DDL.
+        dangerous_tokens = (
+            r"\binsert\b", r"\bupdate\b", r"\bdelete\b", r"\bmerge\b",
+            r"\bdrop\b", r"\balter\b", r"\btruncate\b", r"\bcreate\b",
+            r"\bgrant\b", r"\brevoke\b", r"\bexecute\b", r"\bcall\b"
+        )
+        if ";" in clean:
+            return False
+        if not re.match(r"^\s*select\b", clean, flags=re.IGNORECASE):
+            return False
+        return not any(re.search(token, clean, flags=re.IGNORECASE) for token in dangerous_tokens)
+
+    def _build_limited_query(self, query: str, limit: int = 20) -> str:
+        clean = self._clean_sql(query)
+        dialect_name = (self.engine.dialect.name or "").lower()
+
+        # Se envuelve para forzar limite y evitar dependencia de la query original.
+        if dialect_name in {"oracle"}:
+            return f"SELECT * FROM ({clean}) q FETCH FIRST {limit} ROWS ONLY"
+        return f"SELECT * FROM ({clean}) q LIMIT {limit}"
+
+    @staticmethod
+    def _render_query_result_html(df: pd.DataFrame, title: str, max_rows: int = 20) -> str:
+        styles = (
+            "border-collapse:collapse;width:100%;font-family:Segoe UI,Arial,sans-serif;"
+            "font-size:12px;color:#222;"
+        )
+        th_style = "border:1px solid #d9d9d9;padding:8px;background:#f3f6fa;text-align:left;"
+        td_style = "border:1px solid #d9d9d9;padding:8px;text-align:left;vertical-align:top;"
+
+        head_cells = "".join(f"<th style='{th_style}'>{escape(str(col))}</th>" for col in df.columns)
+        rows_html = []
+        for _, row in df.iterrows():
+            row_cells = "".join(
+                f"<td style='{td_style}'>{escape('' if pd.isna(v) else str(v))}</td>"
+                for v in row.values
+            )
+            rows_html.append(f"<tr>{row_cells}</tr>")
+
+        body_rows = "".join(rows_html) if rows_html else (
+            f"<tr><td colspan='{max(1, len(df.columns))}' style='{td_style}'>Sin registros</td></tr>"
+        )
+
+        return (
+            f"<h3 style='font-family:Segoe UI,Arial,sans-serif;color:#1f2937;'>{escape(title)}</h3>"
+            f"<p style='font-family:Segoe UI,Arial,sans-serif;font-size:12px;color:#4b5563;'>"
+            f"Mostrando maximo {max_rows} registros.</p>"
+            f"<table style='{styles}'>"
+            f"<thead><tr>{head_cells}</tr></thead>"
+            f"<tbody>{body_rows}</tbody>"
+            f"</table>"
+        )
+
+    def _build_query_section(self, stage: StageConfig, captured_params: dict[str, Any]) -> dict[str, Any]:
+        max_rows = stage.max_rows if stage.max_rows else 20
+        if max_rows < 1:
+            max_rows = 1
+        if max_rows > 20:
+            max_rows = 20
+
+        if not stage.query_sql:
+            return {
+                "stage_name": stage.name,
+                "status": "error",
+                "message": "No se configuro query_sql",
+                "html": "<p style='font-family:Segoe UI,Arial,sans-serif;'>Consulta no disponible: falta query_sql.</p>",
+                "row_count": 0,
+                "max_rows": max_rows,
+                "truncated": False,
+                "query_hash": None,
+            }
+
+        try:
+            query_sql = stage.query_sql.format(**captured_params)
+            query_title = (stage.query_title or stage.name).format(**captured_params)
+        except KeyError as e:
+            return {
+                "stage_name": stage.name,
+                "status": "error",
+                "message": f"Falta parametro para construir query: {e}",
+                "html": "<p style='font-family:Segoe UI,Arial,sans-serif;'>Consulta no disponible por parametros faltantes.</p>",
+                "row_count": 0,
+                "max_rows": max_rows,
+                "truncated": False,
+                "query_hash": None,
+            }
+
+        if not self._is_safe_select_query(query_sql):
+            return {
+                "stage_name": stage.name,
+                "status": "error",
+                "message": "La consulta no cumple las reglas de seguridad (solo SELECT simple).",
+                "html": "<p style='font-family:Segoe UI,Arial,sans-serif;'>Consulta no permitida por reglas de seguridad.</p>",
+                "row_count": 0,
+                "max_rows": max_rows,
+                "truncated": False,
+                "query_hash": hashlib.sha256(self._clean_sql(query_sql).encode("utf-8")).hexdigest(),
+            }
+
+        base_query = self._clean_sql(query_sql)
+        query_hash = hashlib.sha256(base_query.encode("utf-8")).hexdigest()
+        limited_query = self._build_limited_query(base_query, max_rows)
+
+        try:
+            df = pd.read_sql(text(limited_query), con=self.engine)
+            html_table = self._render_query_result_html(df, query_title, max_rows=max_rows)
+            return {
+                "stage_name": stage.name,
+                "status": "ok",
+                "message": None,
+                "html": html_table,
+                "row_count": int(len(df)),
+                "max_rows": max_rows,
+                "truncated": bool(len(df) >= max_rows),
+                "query_hash": query_hash,
+            }
+        except Exception as e:
+            logging.warning(f"Error ejecutando consulta adicional: {e}")
+            return {
+                "stage_name": stage.name,
+                "status": "error",
+                "message": str(e),
+                "html": "<p style='font-family:Segoe UI,Arial,sans-serif;'>No se pudo obtener la consulta solicitada.</p>",
+                "row_count": 0,
+                "max_rows": max_rows,
+                "truncated": False,
+                "query_hash": query_hash,
+            }
     
     def _should_skip_stage(self, stage: StageConfig, captured_params: dict[str,Any]) -> bool:
         # Se sustituyen las variables capturadas en la condición
@@ -161,7 +317,7 @@ class Pipeline:
                         }
         return log_summ
     
-    def send_log_summarized(self,esquema: str ="orquestador",tabla: str ="log_procesos") -> None:
+    def send_unified_report(self, esquema: str ="orquestador", tabla: str ="log_procesos") -> None:
         """
         Envía el resumen del log por http post a un endpoint
 
@@ -177,7 +333,7 @@ class Pipeline:
         None
         """
         
-        # - Consultar la vista de log para traer los datos de la tarea
+        # Consultar log de la ejecucion actual.
         query = f"""
             SELECT FECEJEC, FECFIN, DURACION, PROCESO, RESUMEN, RESULTADO
             FROM {esquema}.{tabla}
@@ -189,15 +345,24 @@ class Pipeline:
             df = pd.read_sql(query,con=self.engine)
             logging.info(f"Consulta ok. Se obtuvieron {len(df)} filas.")
         
-            # - Crear el diccionario
+            # Crear bloque log.
             log_dict = df.to_json(orient="records",date_format='iso')
             parsed = loads(log_dict)
-            
-            # - Enviar el resumen de log a power automate
+            log_summary = parsed[0] if parsed else {}
+
+            unified_payload = {
+                "ejecucion_id": self.ejecucion_id,
+                "process_name": self.process_name,
+                "requested_by": getpass.getuser().upper(),
+                "requested_at": datetime.now().strftime(DEFAULT_DATE_FORMAT),
+                "log_summary": log_summary,
+                "query_sections": self.query_sections,
+            }
+
+            # Enviar un unico payload a power automate.
             try:
-                logging.info("Haciendo el http request a power automate...")
-                # result = send_info_by_url(parsed[0])
-                result = post_to_flow(parsed[0])
+                logging.info("Haciendo el http request unificado a power automate...")
+                result = post_to_flow(unified_payload)
                 logging.info(result)
             except Exception as e:
                 logging.warning(f"Error al enviar correo: {e}")
@@ -322,6 +487,24 @@ class Pipeline:
                 except Exception as e:
                     logging.error(f"Error al evaluar la condición en la etapa '{stage.name}': {e}")
                     return False
+
+            if stage.stage_type == "query":
+                logging.info("-"*50)
+                logging.info(f"Iniciando etapa (QUERY): {stage.name}")
+                query_section = self._build_query_section(stage, captured_params)
+                self.query_sections.append(query_section)
+                if stage.result_key:
+                    captured_params[stage.result_key] = str(query_section.get("row_count", 0))
+                    logging.info(f"parametro capturado: {stage.result_key} = {captured_params[stage.result_key]}")
+
+                if query_section.get("status") == "error":
+                    logging.warning(f"Etapa QUERY con error en '{stage.name}': {query_section.get('message')}")
+                else:
+                    logging.info(
+                        f"Etapa QUERY '{stage.name}' OK. Filas: {query_section.get('row_count', 0)} "
+                        f"(max {query_section.get('max_rows', 20)})"
+                    )
+                continue
             
             if stage.run_as_bat: # Verifica si en la estapa se ha configurado la ejecucion de un BAT
                 logging.info("-"*50)
@@ -378,8 +561,8 @@ class Pipeline:
                         # Insertar resumen en la bd
                         self.insert_rows(summ_pandas)
                     
-                        # Enviar el log a power automate
-                        self.send_log_summarized()
+                        # Enviar el reporte unificado a power automate
+                        self.send_unified_report()
                         
                     return False
                 
@@ -403,7 +586,7 @@ class Pipeline:
             # Insertar resumen en la bd
             self.insert_rows(summ_pandas)
         
-            # Enviar el log a power automate
-            self.send_log_summarized()
+            # Enviar el reporte unificado a power automate
+            self.send_unified_report()
             
         return True

@@ -14,9 +14,13 @@ class StageResult:
 @dataclass(frozen=True)
 class StageConfig:
     name: str
-    command: str
+    command: str = ""
+    stage_type: str = "command"
     run_as_bat: bool = False
     show_output: bool = False
     timeout: Optional[int] = None
     result_key: Optional[str] = None
     condicion: Optional[str] = None
+    query_sql: Optional[str] = None
+    query_title: Optional[str] = None
+    max_rows: int = 20

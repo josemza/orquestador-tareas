@@ -45,7 +45,16 @@ def main():
     bat_path = get_unc_path(args.batpath) if args.batpath else None
     ejecucion_id = str(uuid.uuid4())
     
-    pipeline = Pipeline(commands,engine,process_name,log_file,path_log_summ,bat_path,dev_mode, ejecucion_id)
+    pipeline = Pipeline(
+        commands,
+        engine,
+        process_name,
+        log_file,
+        path_log_summ,
+        bat_path,
+        dev_mode,
+        ejecucion_id,
+    )
     success = pipeline.run()
     
     if not success:
