@@ -1,60 +1,58 @@
 # -*- coding: utf-8 -*-
+"""
+fecha: 30/01/2025
+version: 9.0
+Cambios:
+    - Se agrega registro de tiempos por etapa.
+    - Se modulariza el script para mejor mantenimiento
 
-from configparser import ConfigParser
+@author: Jose Zuniga
+"""
+
 import argparse
 import sys
 import uuid
 
-from db.engine import get_engine
-from orquestador.models import StageConfig
-from orquestador.config_loader import build_stage
+
+from conexion.conexion import get_engine
 from orquestador.paths import get_unc_path
+from orquestador.config_loader import arg_parser
 from orquestador.logging_setup import setup_logging
-from orquestador.pipeliine import Pipeline
+from orquestador.pipeline import Pipeline
+from orquestador.utils import parse_extra_args
+
 
 def main():
-    # Permite pasar argumentos desde la linea de comandos, como la ruta al archivo de configuracion
+    #---- Parsear argumentos del BAT ----#
+
     parser = argparse.ArgumentParser(description="Pipeline para automatizar procesos en GCI")
     parser.add_argument('--config', help="Ruta del archivo de configuracion", default="proceso.ini")
     parser.add_argument('--batpath', type=str, help="Ruta completa del archivo .bat que ejecuto este script", default=None)
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+
+    #---- Parsear argumentos extraen un diccionario ----#
     
-    # Cargar configuracion externa
-    config = ConfigParser()
-    config.read(args.config)
+    extra_params = parse_extra_args(unknown)
     
-    # Configuracion general del log
-    log_file = config.get("GENERAL", "log_file", fallback="proceso.log")
-    logger = setup_logging(log_file)
-    
-    path_log_summ = config.get("GENERAL", "path_log_summ", fallback=None)
-    process_name = config.get("GENERAL", "process_name", fallback=None)
-    dev_mode = config.get("GENERAL", "dev_mode", fallback="false")
-    
-    # Establecer la conexion con la BBDD
-    engine = get_engine()
-    
-    # Definir las etapas del pipeline basadas en el archivo de configuracion
-    # Se puede tener en el archivo una seccion GENERAL y luego una seccion por cada etapa
-    commands: list[StageConfig] = []
-    for section in config.sections():
-        if section != "GENERAL":
-            commands.append(build_stage(config,section))
-    
-    # Obtener la ruta UNC del bat en caso llegue como ruta mapeada X:, Z:, etc
-    bat_path = get_unc_path(args.batpath) if args.batpath else None
+    #---- Configurar el proceso ----#
+
+    engine = get_engine() # Establecer la conexion con la BBDD
+    commands,general_config = arg_parser(args) # Levantar las configuraciones
+    logger = setup_logging(general_config.log_file)
+    bat_path = get_unc_path(args.batpath) if args.batpath else None # Obtener la ruta UNC del bat en caso llegue como ruta mapeada X:, Z:, etc
     ejecucion_id = str(uuid.uuid4())
-    
+
+    #---- Ejecutar el Pipeline configurado ----#
+
     pipeline = Pipeline(
-        commands,
-        engine,
-        process_name,
-        log_file,
-        path_log_summ,
-        bat_path,
-        dev_mode,
-        ejecucion_id,
-    )
+        commands=commands,
+        engine=engine,
+        general_config=general_config,
+        bat_path=bat_path,
+        ejecucion_id=ejecucion_id,
+        initial_params=extra_params,
+        )
+    
     success = pipeline.run()
     
     if not success:
@@ -62,7 +60,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-        
-    
-    
