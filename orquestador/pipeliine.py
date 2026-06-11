@@ -16,7 +16,7 @@ from sqlalchemy.engine import Engine
 from orquestador.constants import DEFAULT_DATE_FORMAT, MAX_OUTPUT_CHARS, MAX_BYTES
 from orquestador.models import StageConfig, StageResult, GeneralConfig
 from orquestador.paths import fingerprint_from_norm_path
-from send_to_cloud.http_conexion_beta import post_to_flow
+from send_to_cloud.http_conexion import post_to_flow
 from mapeo.identificar_etapa import mapeo_etapa
 from mapeo.cargar_mapeo_bbdd import insert_rows
 
