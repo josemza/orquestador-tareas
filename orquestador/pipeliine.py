@@ -1,38 +1,28 @@
 from datetime import datetime
 import getpass
 import hashlib
-from json import loads
+from json import loads, dumps
 from html import escape
 import logging
 import re
 import socket
 import subprocess
 import time
-from typing import Optional, Any
-
+from typing import Any, Optional
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import DateTime, Numeric, text, LargeBinary
 from sqlalchemy.engine import Engine
-from sqlalchemy.types import DateTime, Numeric
 
-from send_to_cloud.http_conexion import post_to_flow
-from orquestador.models import StageConfig, StageResult
+from orquestador.constants import DEFAULT_DATE_FORMAT, MAX_OUTPUT_CHARS, MAX_BYTES
+from orquestador.models import StageConfig, StageResult, GeneralConfig
 from orquestador.paths import fingerprint_from_norm_path
-from orquestador.constants import MAX_OUTPUT_CHARS, DEFAULT_DATE_FORMAT
+from send_to_cloud.http_conexion_beta import post_to_flow
+from mapeo.identificar_etapa import mapeo_etapa
+from mapeo.cargar_mapeo_bbdd import insert_rows
 
 
 class Pipeline:
-    def __init__(
-        self,
-        commands: list[StageConfig],
-        engine: Engine,
-        process_name: str = None,
-        log_file: str = None,
-        path_log_summ: str = None,
-        bat_path: str = None,
-        dev_mode: str = "False",
-        ejecucion_id: str = None,
-    ) -> None:
+    def __init__(self, commands: list[StageConfig],engine: Engine,general_config: GeneralConfig,bat_path: str = None,ejecucion_id: str = None,initial_params: dict = None) -> None:
         """
         Clase para manejar las etapas del proceso
 
@@ -42,13 +32,14 @@ class Pipeline:
             lista de diccionarios con la estructura:
                 {
                     "name": <nombre_etapa>,
-                    "type": <command|query> (opcional, por defecto command),
-                    "command": <comando_a_ejecutar> (requerido para command),
-                    "query_sql": <consulta_select> (requerido para query),
-                    "query_title": <titulo_html_consulta> (opcional),
+                    "type": <command|query> (opcional, por defecto command)
+                    "command": <comando_a_ejecutar>,
                     "timeout": <tiempo_maximo_opcional>,
                     "result_key": <clave para almacenar la salida> (opcional)
                     "run_as_bat": <True/False> (opcional)
+                    "allow_error": <True/False> (opcional)
+                    "query_sql": <consulta_select> (Requerido para query)
+                    "query_title": <titulo_html_consulta> (opcional)
                 }
         engine: sqlalchemy.engine.base.Engine
             engine de sqlalchemy con la conexión a la base de datos
@@ -58,7 +49,7 @@ class Pipeline:
             Ruta del archivo csv donde colocar el resumen del log (exitoso o error)
         bat_path: string
             Ruta del archivo bat que se ejecutara
-        dev_mode: string
+        dev_mode: bool
             Modo de desarrollo (opcional)
         ejecucion_id: string
             Id de ejecucion (opcional)
@@ -70,32 +61,35 @@ class Pipeline:
         """
         
         self.commands: list[StageConfig] = commands
-        self.process_name = process_name
-        self.path_log_summ = path_log_summ
-        self.log_file = log_file
-        self.bat_path = bat_path
-        self.start_time = datetime.now()
-        self.end_time = datetime.now()
-        self.engine = engine
-        self.dev_mode = dev_mode
-        self.proceso_id = fingerprint_from_norm_path(self.bat_path) if self.bat_path else None
-        self.ejecucion_id = ejecucion_id
+        self.process_name: str = general_config.process_name
+        self.path_log_summ: str = general_config.path_log_summ
+        self.log_file: str = general_config.log_file
+        self.bat_path: str = bat_path
+        self.start_time: datetime = None
+        self.end_time: datetime = None
+        self.engine: Engine = engine
+        self.dev_mode: bool = general_config.dev_mode
+        self.proceso_id: str = fingerprint_from_norm_path(self.bat_path) if self.bat_path else None
+        self.ejecucion_id: str = ejecucion_id       
+        self.initial_params = initial_params or {}
         self.query_sections: list[dict[str, Any]] = []
-        
+    
+    def _welcome_message(self) -> None:
         logging.info("="*50)
         logging.info(f"Nueva ejecucion {self.process_name}")
+        logging.info(f"Id ejecucion: {self.ejecucion_id}")
         logging.info("="*50)
 
     @staticmethod
     def _clean_sql(query: str) -> str:
         return (query or "").strip().rstrip(";").strip()
-
+    
     def _is_safe_select_query(self, query: str) -> bool:
         clean = self._clean_sql(query)
         if not clean:
             return False
-
-        # Evita multiples sentencias y operaciones DML/DDL.
+        
+        # Evita multiples sentencias y operaciones DML/DDL
         dangerous_tokens = (
             r"\binsert\b", r"\bupdate\b", r"\bdelete\b", r"\bmerge\b",
             r"\bdrop\b", r"\balter\b", r"\btruncate\b", r"\bcreate\b",
@@ -111,11 +105,11 @@ class Pipeline:
         clean = self._clean_sql(query)
         dialect_name = (self.engine.dialect.name or "").lower()
 
-        # Se envuelve para forzar limite y evitar dependencia de la query original.
+        # Se envuelve para forzar limite y evitar dependencia de la query original
         if dialect_name in {"oracle"}:
             return f"SELECT * FROM ({clean}) q FETCH FIRST {limit} ROWS ONLY"
         return f"SELECT * FROM ({clean}) q LIMIT {limit}"
-
+    
     @staticmethod
     def _render_query_result_html(df: pd.DataFrame, title: str, max_rows: int = 20) -> str:
         styles = (
@@ -223,7 +217,7 @@ class Pipeline:
                 "truncated": False,
                 "query_hash": query_hash,
             }
-    
+
     def _should_skip_stage(self, stage: StageConfig, captured_params: dict[str,Any]) -> bool:
         # Se sustituyen las variables capturadas en la condición
         condicion_formateada = stage.condicion.format(**captured_params)
@@ -243,7 +237,12 @@ class Pipeline:
         if stage.show_output:
             output_successfully[stage.name] = result.stdout # output
 
-    def insert_rows(self, datos: pd.DataFrame, esquema: str = "orquestador", tabla: str = "log_procesos") -> None:
+    def _make_dataframe_log_stage(self) -> pd.DataFrame:
+        columnas = ["ejecucion_id","stagename","ok","returncode","stdout","stderr","duration_s","fatal","stage_category"]
+        
+        return pd.DataFrame(columns=columnas)
+    
+    def insert_rows(self, datos: pd.DataFrame, esquema: str = "usbds01", tabla: str = "log_procesos", dtypearg: dict[str,Any] = None) -> None:
         """
         Inserta los datos en la tabla log_procesos
 
@@ -260,8 +259,6 @@ class Pipeline:
         -------
         None
         """
-        datos["fecejec"] = pd.to_datetime(datos["fecejec"])
-        datos["fecfin"] = pd.to_datetime(datos["fecfin"])
 
         try:
             logging.info(f"Insertando resumen del log en {esquema}.{tabla}...")
@@ -270,16 +267,12 @@ class Pipeline:
                          if_exists="append", 
                          index=False,
                          schema=esquema,
-                         dtype={
-                             "fecejec": DateTime(),
-                             "fecfin": DateTime(),
-                             "duracion": Numeric(8,3)
-                             }
+                         dtype=dtypearg
                          )
-        except Exception:
-            logging.warning(f"No se pudo insertar el resumen del log en {esquema}.{tabla}...")
+        except Exception as e:
+            logging.warning(f"No se pudo insertar el resumen del log en {esquema}.{tabla}...{e}")
     
-    def log_summarized_dict(self, **kwargs) -> dict[str, list[Any]]:
+    def log_summarized_pandas(self, **kwargs) -> tuple[pd.DataFrame,dict[str,Any]]:
         """
         Genera un diccionario con el resumen del log
 
@@ -302,22 +295,52 @@ class Pipeline:
             result_message = ""
 
         log_summ = {
-                            "fecejec": [datetime.strftime(self.start_time, DEFAULT_DATE_FORMAT)],
-                            "fecfin": [datetime.strftime(self.end_time, DEFAULT_DATE_FORMAT)],
-                            "duracion":[(self.end_time - self.start_time).total_seconds() / 60],
-                            "proceso": [self.process_name],
-                            "resultado":[result_message],
-                            "resumen": ["error" if "output_error" in kwargs else "exitoso"],
-                            "rutalog": [self.log_file],
-                            "rutabat": [self.bat_path],
-                            "usuario": [getpass.getuser().upper()],
-                            "terminal":[socket.gethostname()],
-                            "bat_sha256": [self.proceso_id],
-                            "ejecucion_id": [self.ejecucion_id]
-                        }
-        return log_summ
+                        "fecejec": [datetime.strftime(self.start_time, DEFAULT_DATE_FORMAT)],
+                        "fecfin": [datetime.strftime(self.end_time, DEFAULT_DATE_FORMAT)],
+                        "duracion":[(self.end_time - self.start_time).total_seconds() / 60],
+                        "proceso": [self.process_name],
+                        "resultado":[result_message],
+                        "resumen": ["error" if "output_error" in kwargs else "exitoso"],
+                        "rutalog": [self.log_file],
+                        "rutabat": [self.bat_path],
+                        "usuario": [getpass.getuser().upper()],
+                        "terminal":[socket.gethostname()],
+                        "bat_sha256": [self.proceso_id],
+                        "ejecucion_id": [self.ejecucion_id]
+                    }
+        
+        log_summ_pd = pd.DataFrame(log_summ)
+        log_summ_pd["fecejec"] = pd.to_datetime(log_summ_pd["fecejec"])
+        log_summ_pd["fecfin"] = pd.to_datetime(log_summ_pd["fecfin"])
+
+        dtype= {
+                    "fecejec": DateTime(),
+                    "fecfin": DateTime(),
+                    "duracion": Numeric(8,3)
+                }
+
+        return log_summ_pd, dtype
     
-    def send_unified_report(self, esquema: str ="orquestador", tabla: str ="log_procesos") -> None:
+    def log_stage_dict(self, stage_result: StageResult, stage_name: str, stage_category: str) -> dict[str,list[Any]]:
+        log_stage = {
+            "ejecucion_id": self.ejecucion_id,
+            "stagename": stage_name,
+            "ok": stage_result.ok,
+            "returncode": stage_result.returncode,
+            "stdout": stage_result.stdout,
+            "stderr": stage_result.stderr,
+            "duration_s": stage_result.duration_s,
+            "fatal": stage_result.fatal,
+            "stage_category": stage_category
+        }
+
+        return log_stage
+    
+    def append_log_stages(self, log_stage: dict[str,Any], datacol: pd.DataFrame) -> None:
+        datos_mapeados = {k: (int(v) if isinstance(v, bool) else v) for k, v in log_stage.items()}
+        datacol.loc[len(datacol)] = datos_mapeados
+
+    def send_log_summarized(self,esquema: str ="usods01",tabla: str ="log_procesos") -> None:
         """
         Envía el resumen del log por http post a un endpoint
 
@@ -333,9 +356,10 @@ class Pipeline:
         None
         """
         
-        # Consultar log de la ejecucion actual.
+        # - Consultar la vista de log para traer los datos de la tarea
         query = f"""
-            SELECT FECEJEC, FECFIN, DURACION, PROCESO, RESUMEN, RESULTADO
+            SELECT FECEJEC, FECFIN, DURACION, PROCESO, TASKNAME, RESUMEN, RESULTADO, CARPETAPROCESO, RUTALOG, RUTABAT, EJECUTADO_POR, 
+            EJECUTADO_EN, PROGRAMADO_EN, NEXTRUNTIME, PROGRAMACIONTEXT
             FROM {esquema}.{tabla}
             WHERE ejecucion_id = '{self.ejecucion_id}'
         """
@@ -345,9 +369,10 @@ class Pipeline:
             df = pd.read_sql(query,con=self.engine)
             logging.info(f"Consulta ok. Se obtuvieron {len(df)} filas.")
         
-            # Crear bloque log.
+            # - Crear el bloque log
             log_dict = df.to_json(orient="records",date_format='iso')
             parsed = loads(log_dict)
+            
             log_summary = parsed[0] if parsed else {}
 
             unified_payload = {
@@ -359,15 +384,36 @@ class Pipeline:
                 "query_sections": self.query_sections,
             }
 
-            # Enviar un unico payload a power automate.
+            logging.info(unified_payload)
+
+            # - Enviar el resumen de log y consultas a power automate
             try:
-                logging.info("Haciendo el http request unificado a power automate...")
-                result = post_to_flow(unified_payload)
+                logging.info("Haciendo el http request a power automate...")
+                # result = send_info_by_url(parsed[0])
+                result = post_to_flow(unified_payload)                
                 logging.info(result)
+
+                if result[0].status_code < 200 or result[0].status_code >= 300:
+                    contingencia_envios = {
+                        "ejecucion_id": self.ejecucion_id,
+                        "estado": "no enviado",
+                        "query_sections": self.query_sections,
+                    }
+                    contingencia_envios_df = pd.DataFrame.from_dict([contingencia_envios])
+                    contingencia_envios_df["query_sections"] = contingencia_envios_df["query_sections"].apply(lambda x: dumps(x).encode("utf-8") if x is not None else None)
+                    self.insert_rows(contingencia_envios_df,"usods01","log_contingencia_envios",{"query_sections": LargeBinary})
             except Exception as e:
+                contingencia_envios = {
+                    "ejecucion_id": self.ejecucion_id,
+                    "estado": "no enviado",
+                    "query_sections": self.query_sections,
+                }
+                contingencia_envios_df = pd.DataFrame.from_dict([contingencia_envios])
+                contingencia_envios_df["query_sections"] = contingencia_envios_df["query_sections"].apply(lambda x: dumps(x).encode("utf-8") if x is not None else None)
+                self.insert_rows(contingencia_envios_df,"usods01","log_contingencia_envios",{"query_sections": LargeBinary})
                 logging.warning(f"Error al enviar correo: {e}")
 
-    def run_stage(self, stage_name: str, command: str, timeout: Optional[int] = None) -> StageResult:
+    def run_stage(self, stage_name: str, command: str, timeout: Optional[int] = None, allow_error: Optional[bool] = True) -> StageResult:
         """
         Ejecuta una etapa del pipeline y registra la salida y errores. 
         Si ocurre un error o se excede el tiempo de espera, retorna False
@@ -406,14 +452,17 @@ class Pipeline:
                     logging.warning(f"{stage_name} STDERR:\n{result.stderr}")
             
             if result.returncode != 0:
-                logging.error(f"Error en {stage_name} (codigo: {result.returncode}). Deteniendo el pipeline")
+                if allow_error:
+                    logging.warning(f"Error en {stage_name}. **No se detiene el pipeline por configuracion allow_error = {allow_error}")
+                else:
+                    logging.error(f"Error en {stage_name} (codigo: {result.returncode}). Deteniendo el pipeline. Detalle:\n{result.stderr or result.stdout}")
                 return StageResult(
                     ok=False,
                     returncode=result.returncode,
                     stdout=(result.stdout or "").strip(),
                     stderr=(result.stderr or "").strip(),
-                    duration_s=elapsed/60,
-                    fatal=True
+                    duration_s=elapsed,
+                    fatal= True if not allow_error else False
                 )
             
             logging.info(f"{stage_name} completada exitosamente")
@@ -422,7 +471,7 @@ class Pipeline:
                 returncode=0,
                 stdout=(result.stdout or "").strip(),
                 stderr=(result.stderr or "").strip(),
-                duration_s=elapsed/60,
+                duration_s=elapsed,
                 fatal=False
             )
 
@@ -435,7 +484,7 @@ class Pipeline:
                 stdout="",
                 stderr="",
                 error=str(e).strip(),
-                duration_s=elapsed/60,
+                duration_s=elapsed,
                 fatal=True
             )
         except Exception as e:
@@ -447,7 +496,7 @@ class Pipeline:
                 stdout="",
                 stderr="",
                 error=str(e).strip(),
-                duration_s=elapsed/60,
+                duration_s=elapsed,
                 fatal=True
             )
     
@@ -463,15 +512,20 @@ class Pipeline:
         Booleano
 
         """
-        
-        captured_params: dict[str, Any] = {}
+        self.start_time = datetime.now()
+        self._welcome_message()
+
+        captured_params: dict[str, Any] = self.initial_params.copy()
         output_successfully: dict[str, str] = {}
+        stage_log_df: pd.DataFrame = self._make_dataframe_log_stage()
         
         #Agregar la fecha de ejecucion automaticamente
         now = datetime.now()
         captured_params["anio"] = now.strftime("%Y")
         captured_params["mes"] = now.strftime("%m")
-        captured_params["dia"] = now.strftime("%d")        
+        captured_params["dia"] = now.strftime("%d")   
+
+        logging.info(f"Parametros iniciales disponibles: {captured_params.keys()}")     
         
         for stage in self.commands:           
             # Si se define la condición, se evalúa antes de ejecutar la etapa
@@ -487,7 +541,7 @@ class Pipeline:
                 except Exception as e:
                     logging.error(f"Error al evaluar la condición en la etapa '{stage.name}': {e}")
                     return False
-
+            
             if stage.stage_type == "query":
                 logging.info("-"*50)
                 logging.info(f"Iniciando etapa (QUERY): {stage.name}")
@@ -496,16 +550,15 @@ class Pipeline:
                 if stage.result_key:
                     captured_params[stage.result_key] = str(query_section.get("row_count", 0))
                     logging.info(f"parametro capturado: {stage.result_key} = {captured_params[stage.result_key]}")
-
                 if query_section.get("status") == "error":
                     logging.warning(f"Etapa QUERY con error en '{stage.name}': {query_section.get('message')}")
                 else:
                     logging.info(
-                        f"Etapa QUERY '{stage.name}' OK. Filas: {query_section.get('row_count', 0)} "
+                        f"Etapa Query '{stage.name}' OK. Filas: {query_section.get('row_count', 0)} "
                         f"(max {query_section.get('max_rows', 20)})"
                     )
                 continue
-            
+
             if stage.run_as_bat: # Verifica si en la estapa se ha configurado la ejecucion de un BAT
                 logging.info("-"*50)
                 logging.info(f"Iniciando etapa (BAT): {stage.name} ejecutando: {stage.command}")
@@ -546,27 +599,47 @@ class Pipeline:
                         logging.error(f"Falta el parametro {e} para el comando en la etapa '{stage.name}'.")
                         return False
                 
-                result = self.run_stage(stage.name, command_params or stage.command, stage.timeout)
+                result = self.run_stage(stage.name, command_params or stage.command, stage.timeout, stage.allow_error)
                 if not result.ok and result.fatal:
                     logging.info("-"*50)
                     logging.error(f"##> RESULTADO: Pipeline detenido por error en la etapa {stage.name}.")
-                    
+
                     self.end_time = datetime.now() # actualizar hora de fin
-                    output_error = result.stderr or result.stdout or result.error or ""
-                    log_summ = self.log_summarized_dict(stage_name=stage.name, output_error=output_error[:MAX_OUTPUT_CHARS])
-                    summ_pandas = pd.DataFrame(log_summ)
-                    
+
                     # Si esta en modo desarrollo no cargar el resumen a la bbdd ni desencadenar el power automate
-                    if not (self.dev_mode.lower() == "true"):
-                        # Insertar resumen en la bd
-                        self.insert_rows(summ_pandas)
+                    if not self.dev_mode:
+                        output_error = result.stderr or result.stdout or result.error or ""
+
+                        b = output_error.encode("utf-8", errors="replace")
+                        if len(b) > MAX_BYTES:
+                            detalle_db = b[:MAX_BYTES].decode("utf-8", errors="ignore") + " ...[TRUNCADO]"
+                        else:
+                            detalle_db = output_error
+
+                        log_summ,dtypes = self.log_summarized_pandas(stage_name=stage.name, output_error=detalle_db)
+                        self.insert_rows(datos=log_summ,esquema="usbds01",tabla="log_procesos_copy",dtypearg=dtypes) # Insertar resumen log en la bd
+
+                        # log_stage = self.log_stage_dict(stage_result=result,stage_name=stage.name,stage_category="")
+                        # self.append_log_stages(log_stage=log_stage,datacol=stage_log_df)
+                        self.insert_rows(datos=stage_log_df,esquema="usbds01",tabla="log_stage_proceso",dtypearg={"duration_s": Numeric(8,3)})
                     
-                        # Enviar el reporte unificado a power automate
-                        self.send_unified_report()
+                        # Enviar el log a power automate
+                        self.send_log_summarized(esquema="usods01", tabla="log_procesos_view_copy")
                         
-                    return False
-                
+                    return False                
+
                 self._record_stage_output(stage,result,output_successfully,captured_params)
+
+                if not self.dev_mode:
+                    # mapear etapa
+                    tipo_etapa, info_etapa = mapeo_etapa(stage.command)
+                    if info_etapa:
+                        info_etapa_df = pd.DataFrame(info_etapa)
+                        insert_rows(self.engine,info_etapa_df,self.proceso_id,tipo_etapa)
+                    
+                    # Guardar log del stage en la BD
+                    log_stage = self.log_stage_dict(stage_result=result,stage_name=stage.name,stage_category=tipo_etapa)                        
+                    self.append_log_stages(log_stage=log_stage,datacol=stage_log_df)
         
         logging.info("-"*50)
         logging.info("##> RESULTADO: Pipeline completado exitosamente")
@@ -578,15 +651,14 @@ class Pipeline:
             output_successfully_text += f"[Salida de la etapa: {key}]\n{line}\n{value}\n\n"
 
         self.end_time = datetime.now() # actualizar hora de fin
-        log_summ = self.log_summarized_dict(output_success=output_successfully_text)
-        summ_pandas = pd.DataFrame(log_summ)
 
         # Si esta en modo desarrollo no cargar el resumen a la bd ni desencadenar el power automate
-        if not (self.dev_mode.lower() == "true"):
-            # Insertar resumen en la bd
-            self.insert_rows(summ_pandas)
+        if not self.dev_mode:
+            log_summ,dtypes = self.log_summarized_pandas(output_success=output_successfully_text)
+            self.insert_rows(datos=log_summ,esquema="usbds01",tabla="log_procesos_copy",dtypearg=dtypes) # Insertar resumen log en la bd
+            self.insert_rows(datos=stage_log_df,esquema="usbds01",tabla="log_stage_proceso",dtypearg={"duration_s": Numeric(8,3)}) # Insertar log de stages en la bd
         
-            # Enviar el reporte unificado a power automate
-            self.send_unified_report()
+            # Enviar el log a power automate
+            self.send_log_summarized(esquema="usods01", tabla="log_procesos_view_copy")
             
         return True
