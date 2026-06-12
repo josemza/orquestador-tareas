@@ -1,7 +1,7 @@
 from configparser import ConfigParser
 import argparse
 
-from orquestador.models import StageConfig
+from orquestador.models import StageConfig, GeneralConfig, ConfigTotal
 
 def parse_bool(value: str, default: bool = False) -> bool:
     if value is None:

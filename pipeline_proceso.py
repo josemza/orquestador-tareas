@@ -14,10 +14,11 @@ import sys
 import uuid
 
 
-from conexion.conexion import get_engine
+from db.engine import get_engine
 from orquestador.paths import get_unc_path
 from orquestador.config_loader import arg_parser
 from orquestador.logging_setup import setup_logging
+from orquestador.params_loader import build_context_from_params_file, merge_contexts
 from orquestador.pipeline import Pipeline
 from orquestador.utils import parse_extra_args
 
@@ -33,6 +34,15 @@ def main():
     #---- Parsear argumentos extraen un diccionario ----#
     
     extra_params = parse_extra_args(unknown)
+    params_path = extra_params.get("params")
+
+    if params_path:
+        try:
+            json_context = build_context_from_params_file(params_path)
+            extra_params = merge_contexts(extra_params, json_context)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error al procesar --params: {exc}", file=sys.stderr)
+            sys.exit(1)
     
     #---- Configurar el proceso ----#
 

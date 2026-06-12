@@ -401,7 +401,7 @@ class Pipeline:
                     }
                     contingencia_envios_df = pd.DataFrame.from_dict([contingencia_envios])
                     contingencia_envios_df["query_sections"] = contingencia_envios_df["query_sections"].apply(lambda x: dumps(x).encode("utf-8") if x is not None else None)
-                    self.insert_rows(contingencia_envios_df,"usods01","log_contingencia_envios",{"query_sections": LargeBinary})
+                    # self.insert_rows(contingencia_envios_df,"orquestador","log_contingencia_envios",{"query_sections": LargeBinary})
             except Exception as e:
                 contingencia_envios = {
                     "ejecucion_id": self.ejecucion_id,
@@ -410,7 +410,7 @@ class Pipeline:
                 }
                 contingencia_envios_df = pd.DataFrame.from_dict([contingencia_envios])
                 contingencia_envios_df["query_sections"] = contingencia_envios_df["query_sections"].apply(lambda x: dumps(x).encode("utf-8") if x is not None else None)
-                self.insert_rows(contingencia_envios_df,"usods01","log_contingencia_envios",{"query_sections": LargeBinary})
+                # self.insert_rows(contingencia_envios_df,"orquestador","log_contingencia_envios",{"query_sections": LargeBinary})
                 logging.warning(f"Error al enviar correo: {e}")
 
     def run_stage(self, stage_name: str, command: str, timeout: Optional[int] = None, allow_error: Optional[bool] = True) -> StageResult:
@@ -617,14 +617,14 @@ class Pipeline:
                             detalle_db = output_error
 
                         log_summ,dtypes = self.log_summarized_pandas(stage_name=stage.name, output_error=detalle_db)
-                        self.insert_rows(datos=log_summ,esquema="usbds01",tabla="log_procesos_copy",dtypearg=dtypes) # Insertar resumen log en la bd
+                        self.insert_rows(datos=log_summ,esquema="orquestador",tabla="log_procesos",dtypearg=dtypes) # Insertar resumen log en la bd
 
                         # log_stage = self.log_stage_dict(stage_result=result,stage_name=stage.name,stage_category="")
                         # self.append_log_stages(log_stage=log_stage,datacol=stage_log_df)
-                        self.insert_rows(datos=stage_log_df,esquema="usbds01",tabla="log_stage_proceso",dtypearg={"duration_s": Numeric(8,3)})
+                        self.insert_rows(datos=stage_log_df,esquema="orquestador",tabla="log_stage_proceso",dtypearg={"duration_s": Numeric(8,3)})
                     
                         # Enviar el log a power automate
-                        self.send_log_summarized(esquema="usods01", tabla="log_procesos_view_copy")
+                        self.send_log_summarized(esquema="orquestador", tabla="log_procesos_view")
                         
                     return False                
 
@@ -655,10 +655,10 @@ class Pipeline:
         # Si esta en modo desarrollo no cargar el resumen a la bd ni desencadenar el power automate
         if not self.dev_mode:
             log_summ,dtypes = self.log_summarized_pandas(output_success=output_successfully_text)
-            self.insert_rows(datos=log_summ,esquema="usbds01",tabla="log_procesos_copy",dtypearg=dtypes) # Insertar resumen log en la bd
-            self.insert_rows(datos=stage_log_df,esquema="usbds01",tabla="log_stage_proceso",dtypearg={"duration_s": Numeric(8,3)}) # Insertar log de stages en la bd
+            self.insert_rows(datos=log_summ,esquema="orquestador",tabla="log_procesos",dtypearg=dtypes) # Insertar resumen log en la bd
+            self.insert_rows(datos=stage_log_df,esquema="orquestador",tabla="log_stage_proceso",dtypearg={"duration_s": Numeric(8,3)}) # Insertar log de stages en la bd
         
             # Enviar el log a power automate
-            self.send_log_summarized(esquema="usods01", tabla="log_procesos_view_copy")
+            self.send_log_summarized(esquema="orquestador", tabla="log_procesos_view")
             
         return True

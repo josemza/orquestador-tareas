@@ -32,6 +32,8 @@ test/
 *.log
 *.jsonl
 
+docs/
+
 # Zip/exports generados
 *.zip
 *.csv
