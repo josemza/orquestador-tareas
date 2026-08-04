@@ -51,7 +51,24 @@ def _ensure_object(value: Any, section_name: str) -> dict[str, Any]:
     return value
 
 
-def _set_context_value(context: dict[str, str], key: Any, value: Any, source: str) -> None:
+def _set_context_value(
+    context: dict[str, Any],
+    key: Any,
+    value: Any,
+    source: str,
+    *,
+    preserve_none: bool = False,
+) -> None:
+    if value is None and preserve_none:
+        normalized_key = _normalize_key(key, source)
+        if normalized_key in context and context[normalized_key] is not None:
+            raise ValueError(
+                f"Conflicto dentro del archivo de --params para la clave '{normalized_key}': "
+                f"'{context[normalized_key]}' vs 'None' ({source})."
+            )
+        context[normalized_key] = None
+        return
+
     if not _has_value(value):
         return
 
@@ -91,36 +108,66 @@ def load_params_file(path: str) -> dict[str, Any]:
     return payload
 
 
-def _flatten_file_input(name: str, input_data: dict[str, Any], context: dict[str, str]) -> None:
+def _input_is_required(input_data: dict[str, Any], contract_version: Any, name: str) -> bool:
+    if contract_version != 2:
+        return True
+
+    required = input_data.get("obligatorio", True)
+    if not isinstance(required, bool):
+        raise ValueError(f"El input '{name}' tiene 'obligatorio' inválido; debe ser true o false.")
+    return required
+
+
+def _input_metadata(input_data: dict[str, Any], name: str, allow_null: bool) -> dict[str, Any]:
+    metadata = input_data.get("metadata", {})
+    if metadata is None and allow_null:
+        return {}
+    if "metadata" in input_data:
+        return _ensure_object(metadata, f"inputs.{name}.metadata")
+    return metadata
+
+
+def _flatten_file_input(
+    name: str,
+    input_data: dict[str, Any],
+    context: dict[str, Any],
+    required: bool,
+) -> None:
     value = input_data.get("valor")
     path_value = input_data.get("ruta_archivo")
 
-    if not _has_value(value) and not _has_value(path_value):
+    if required and not _has_value(value) and not _has_value(path_value):
         raise ValueError(
-            f"El input '{name}' no tiene 'valor' y tampoco 'ruta_archivo'."
+            f"El input obligatorio '{name}' no tiene 'valor' y tampoco 'ruta_archivo'."
         )
 
-    metadata = input_data.get("metadata", {})
-    if "metadata" in input_data:
-        metadata = _ensure_object(metadata, f"inputs.{name}.metadata")
+    metadata = _input_metadata(input_data, name, allow_null=not required)
 
     resolved_value = value if _has_value(value) else path_value
     resolved_path = path_value if _has_value(path_value) else value
 
-    _set_context_value(context, name, resolved_value, f"inputs.{name}")
-    _set_context_value(context, f"{name}_ruta", resolved_path, f"inputs.{name}")
-    _set_context_value(context, f"{name}_nombre", metadata.get("nombre_archivo"), f"inputs.{name}.metadata")
-    _set_context_value(context, f"{name}_extension", metadata.get("extension"), f"inputs.{name}.metadata")
+    _set_context_value(context, name, resolved_value, f"inputs.{name}", preserve_none=not required)
+    _set_context_value(context, f"{name}_ruta", resolved_path, f"inputs.{name}", preserve_none=not required)
+    _set_context_value(context, f"{name}_nombre", metadata.get("nombre_archivo"), f"inputs.{name}.metadata", preserve_none=not required)
+    _set_context_value(context, f"{name}_extension", metadata.get("extension"), f"inputs.{name}.metadata", preserve_none=not required)
 
 
-def _flatten_period_input(name: str, input_data: dict[str, Any], context: dict[str, str]) -> None:
+def _flatten_period_input(
+    name: str,
+    input_data: dict[str, Any],
+    context: dict[str, Any],
+    required: bool,
+) -> None:
     value = input_data.get("valor")
     if not _has_value(value):
-        raise ValueError(f"El input '{name}' no tiene 'valor'.")
+        if required:
+            raise ValueError(f"El input obligatorio '{name}' no tiene 'valor'.")
+        _set_context_value(context, name, None, f"inputs.{name}", preserve_none=True)
+        _set_context_value(context, f"{name}_anio", None, f"inputs.{name}", preserve_none=True)
+        _set_context_value(context, f"{name}_mes", None, f"inputs.{name}", preserve_none=True)
+        return
 
-    metadata = input_data.get("metadata", {})
-    if "metadata" in input_data:
-        metadata = _ensure_object(metadata, f"inputs.{name}.metadata")
+    metadata = _input_metadata(input_data, name, allow_null=not required)
 
     period_value = _stringify(value)
     year_value = metadata.get("anio")
@@ -145,25 +192,38 @@ def _flatten_period_input(name: str, input_data: dict[str, Any], context: dict[s
     _set_context_value(context, f"{name}_mes", _stringify(month_value).zfill(2), f"inputs.{name}")
 
 
-def _flatten_text_input(name: str, input_data: dict[str, Any], context: dict[str, str]) -> None:
+def _flatten_text_input(
+    name: str,
+    input_data: dict[str, Any],
+    context: dict[str, Any],
+    required: bool,
+) -> None:
     value = input_data.get("valor")
     if not _has_value(value):
-        raise ValueError(f"El input '{name}' no tiene 'valor'.")
+        if required:
+            raise ValueError(f"El input obligatorio '{name}' no tiene 'valor'.")
+        _set_context_value(context, name, None, f"inputs.{name}", preserve_none=True)
+        return
 
     _set_context_value(context, name, value, f"inputs.{name}")
 
 
-def flatten_params_payload(payload: dict[str, Any]) -> dict[str, str]:
+def flatten_params_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("El payload de --params debe ser un objeto.")
 
-    context: dict[str, str] = {}
+    context: dict[str, Any] = {}
+
+    metadata = None
+    if "metadata" in payload:
+        metadata = _ensure_object(payload["metadata"], "metadata")
+
+    contract_version = metadata.get("contract_version") if metadata is not None else None
 
     for key in ROOT_CONTEXT_KEYS:
         _set_context_value(context, key, payload.get(key), "raíz")
 
-    if "metadata" in payload:
-        metadata = _ensure_object(payload["metadata"], "metadata")
+    if metadata is not None:
         for key, value in metadata.items():
             _set_context_value(context, key, value, "metadata")
 
@@ -191,27 +251,29 @@ def flatten_params_payload(payload: dict[str, Any]) -> dict[str, str]:
                     f"Tipos soportados: {allowed_types}."
                 )
 
+            required = _input_is_required(raw_input, contract_version, input_name)
+
             if input_type == "archivo":
-                _flatten_file_input(input_name, raw_input, context)
+                _flatten_file_input(input_name, raw_input, context, required)
             elif input_type == "periodo":
-                _flatten_period_input(input_name, raw_input, context)
+                _flatten_period_input(input_name, raw_input, context, required)
             else:
-                _flatten_text_input(input_name, raw_input, context)
+                _flatten_text_input(input_name, raw_input, context, required)
 
     return context
 
 
-def build_context_from_params_file(path: str) -> dict[str, str]:
+def build_context_from_params_file(path: str) -> dict[str, Any]:
     payload = load_params_file(path)
     return flatten_params_payload(payload)
 
 
-def merge_contexts(cli_context: dict[str, Any], json_context: dict[str, Any]) -> dict[str, str]:
+def merge_contexts(cli_context: dict[str, Any], json_context: dict[str, Any]) -> dict[str, Any]:
     merged = {_normalize_key(key, "CLI"): _stringify(value) for key, value in cli_context.items()}
 
     for raw_key, raw_value in json_context.items():
         key = _normalize_key(raw_key, "JSON")
-        value = _stringify(raw_value)
+        value = None if raw_value is None else _stringify(raw_value)
 
         if key not in merged:
             merged[key] = value
